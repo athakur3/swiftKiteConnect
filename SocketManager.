@@ -1,0 +1,261 @@
+//
+//  SocketManager.swift
+//
+//  Created by Akshansh Thakur on 15/09/22.
+//
+
+import Foundation
+
+enum WebSocketActions: String {
+    case subscribe
+    case unsubscribe
+    case mode
+}
+
+enum WebSocketModes: String {
+    case ltp
+    case quote
+    case full
+}
+
+struct SocketMessage: Codable {
+    var a: String
+    var v: [Int]
+}
+
+struct SocketMessageMode {
+    var a: String
+    var v: [Any]
+}
+
+typealias SocketValue = (String, [String])
+
+protocol InstrumentWatcherDelegate: AnyObject {
+    func watchIndexWithTokens(tokens: [String])
+    func unWatchIndexWithTokens(tokens: [String])
+    func watchSpecificInstrumentWithToken(token: String)
+    func watchSpecificInstrumentsWithToken(tokens: [String])
+    func processByteData(data: Data) -> [UInt32]
+    func watchNiftyAndBankNifty()
+}
+
+class SocketManager: NSObject {
+    
+    var socketOpen = false
+    var accessToken: String = ""
+    var webSocketTask: URLSessionWebSocketTask?
+    
+    lazy var byteProcessor = ByteProcessor(data: Data())
+    
+    static let shared = SocketManager()
+    
+    weak var indexProcessorDelegate: InstrumentProcessingDelegate?
+    
+    var laneDelegates = [InstrumentProcessingDelegate]()
+    
+    func setupConnection(accessToken: String) {
+        
+        self.accessToken = accessToken
+        
+        let apiKey = GlobalConstants.AuthConstants.API_KEY
+        guard let url = URL(string: "wss://ws.kite.trade?api_key=\(apiKey)&access_token=\(accessToken)") else {
+            return
+        }
+        
+        let session = URLSession(configuration: .default, delegate: self, delegateQueue: nil)
+        webSocketTask = session.webSocketTask(with: url)
+        webSocketTask?.resume() // Websocket connection started
+        socketOpen = true
+    }
+    
+    private func closeConnection() {
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+    }
+    
+    private func subscribeToInstrument(with token: String, mode: String) {
+        subscribeToInstrument(with: [token], mode: mode)
+    }
+    
+    private func subscribeToInstrument(with tokens: [String], mode: String) {
+        let data = SocketMessage(
+            a: WebSocketActions.subscribe.rawValue,
+            v: tokens.map({ Int($0)! })
+        )
+        
+        guard let message = try? JSONEncoder().encode(data) else {
+            return
+        }
+        
+        guard let messageString = String(data: message, encoding: .utf8) else {
+            return
+        }
+        
+        webSocketTask?.send(
+            .string(messageString),
+            completionHandler: { value in
+                if let error = value {
+                    self.handleError(error: error)
+                }
+            }
+        )
+        
+        let modeData: [String : Any] = ["a": "mode", "v": [mode, tokens.map({ Int($0)! })]]
+        
+        guard let modeDataMessage = try? JSONSerialization.data(withJSONObject: modeData, options: .prettyPrinted) else {
+            return
+        }
+        
+        guard let modeMessageString = String(data: modeDataMessage, encoding: .utf8) else {
+            return
+        }
+        
+        webSocketTask?.send(
+            .string(modeMessageString),
+            completionHandler: { value in
+                if let error = value {
+                    self.handleError(error: error)
+                }
+            }
+        )
+    }
+    
+    private func unsubscribeFromInstrument(with token: String, mode: String) {
+        unsubscribeFromInstrument(with: [token], mode: mode)
+    }
+    
+    private func unsubscribeFromInstrument(with tokens: [String], mode: String) {
+        let data = SocketMessage(
+            a: WebSocketActions.unsubscribe.rawValue,
+            v: tokens.map({ Int($0)! })
+        )
+        
+        guard let message = try? JSONEncoder().encode(data) else {
+            return
+        }
+        
+        webSocketTask?.send(
+            .data(message),
+            completionHandler: { value in
+                if let error = value {
+                    self.handleError(error: error)
+                }
+            }
+        )
+    }
+    
+    func sendMessage() {}
+    
+    func receiveMessage() {
+        
+        func processData(data: Data) {
+            byteProcessor = ByteProcessor(data: data)
+            let processedData = byteProcessor.processByteData()
+            
+            processedData.forEach { packet in
+                if "\(packet[0])" == InstrumentsStore.shared.niftyInstrumentToken {
+                    indexProcessorDelegate?.didProcessANiftyPacket(dataPacket: packet)
+                } else if "\(packet[0])" == InstrumentsStore.shared.bankNiftyInstrumentToken {
+                    indexProcessorDelegate?.didProcessABankNiftyPacket(dataPacket: packet)
+                } else if
+                    "\(packet[0])" == TradeExecutionLane.bankNifty.tradables?.0.instrument_token ||
+                        "\(packet[0])" == TradeExecutionLane.bankNifty.tradables?.1.instrument_token {
+                    indexProcessorDelegate?.didProcessAnInstrumentPacket(dataPacket: packet)
+                } else {
+                    laneDelegates.forEach { delegate in
+                        delegate.didProcessAnInstrumentPacket(dataPacket: packet)
+                    }
+                }
+            }
+        }
+        
+        if !socketOpen {
+            setupConnection(accessToken: accessToken)
+        }
+        
+        webSocketTask?.receive(completionHandler: { [weak self] result in
+            
+            switch result {
+            case .failure(let error):
+                print(error.localizedDescription)
+                self?.handleError(error: error)
+            case .success(let message):
+                switch message {
+                case .string(_):
+                    break;
+                case .data(let data):
+                    if data.count > 1 {
+                        processData(data: data)
+                    }
+                default:
+                    print("Unknown type received from WebSocket")
+                }
+            }
+            self?.receiveMessage()
+        })
+        
+    }
+    
+    func handleError(error: Error) {
+        if (error as NSError).code == -1011 {
+            NotificationCenter.default.post(
+                name: NSNotification.Name.init(
+                    rawValue: GlobalConstants.ErrorConstants.BAD_RESPONSE
+                ),
+                object: nil
+            )
+        }
+    }
+    
+}
+
+extension SocketManager: InstrumentWatcherDelegate {
+    func watchNiftyAndBankNifty() {
+        subscribeToInstrument(
+            with: [
+                InstrumentsStore.shared.bankNiftyInstrumentToken,
+                InstrumentsStore.shared.niftyInstrumentToken
+            ],
+            mode: "ltp"
+        )
+    }
+    
+    func watchIndexWithTokens(tokens: [String]) {
+        subscribeToInstrument(with: tokens, mode: "ltp")
+    }
+    
+    func unWatchIndexWithTokens(tokens: [String]) {
+        unsubscribeFromInstrument(with: tokens, mode: "ltp")
+    }
+    
+    func watchSpecificInstrumentWithToken(token: String) {
+        subscribeToInstrument(with: [token], mode: "ltp")
+    }
+    
+    func processByteData(data: Data) -> [UInt32] { return [] }
+    
+    func watchSpecificInstrumentsWithToken(tokens: [String]) {}
+    
+}
+
+
+extension SocketManager: URLSessionWebSocketDelegate {
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
+        print("Web socket opened")
+        socketOpen = true
+        NotificationCenter.default.post(name: Notification.Name("WEB_SOCKET_OPENED"), object: nil)
+    }
+    
+    
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        print("Web socket closed")
+        socketOpen = false
+    }
+}
+
+extension SocketManager: URLSessionDelegate {
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error = error {
+            self.handleError(error: error)
+        }
+    }
+}
